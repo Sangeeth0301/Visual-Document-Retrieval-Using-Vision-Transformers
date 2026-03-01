@@ -35,34 +35,39 @@ def train_retriever(retriever, image_list, queries_list, epochs=30, lr=5e-4):
         {'params': retriever.proj.parameters(), 'lr': lr}             # Train projection layer faster
     ])
     
-    # MiniLM text encoder is kept frozen for this educational exercise
+    # Pre-compute fixed tensors to eliminate major pipeline lags
+    print("Pre-computing text embeddings and image vectors to avoid training lags...")
+    with torch.no_grad():
+        text_raw = retriever.text_encoder.encode(queries_list, convert_to_tensor=True, device=retriever.device)
+        text_embs = F.normalize(text_raw, p=2, dim=-1)
+        
+    batch_tensors = [retriever.image_transform(img) for img in image_list]
+    x = torch.stack(batch_tensors).to(retriever.device)
     
     for epoch in range(epochs):
         optimizer.zero_grad()
         
         # 1. Forward Pass: Images -> (Batch, 384)
-        # Note: We must re-encode and train the graph, not use detached features.
-        batch_tensors = [retriever.image_transform(img) for img in image_list]
-        x = torch.stack(batch_tensors).to(retriever.device)
-        
         vit_embeddings = retriever.vit_model(x)
         aligned_embeddings = retriever.proj(vit_embeddings)
         img_embs = F.normalize(aligned_embeddings, p=2, dim=-1)
         
-        # 2. Forward Pass: Text Queries (frozen, detached)
-        with torch.no_grad():
-            text_raw = retriever.text_encoder.encode(queries_list, convert_to_tensor=True, device=retriever.device)
-            text_embs = F.normalize(text_raw, p=2, dim=-1)
-        
-        # 3. Compute InfoNCE Loss
+        # 2. Compute InfoNCE Loss vs pre-computed text queries
         loss = contrastive_loss(img_embs, text_embs)
         
-        # 4. Backward & Step
+        # Rapid Rank-1 Accuracy Tracking
+        with torch.no_grad():
+            sims = torch.matmul(img_embs, text_embs.T)
+            preds = torch.argmax(sims, dim=1)
+            targets = torch.arange(len(preds)).to(retriever.device)
+            acc = torch.sum(preds == targets).float() / len(preds) * 100.0
+        
+        # 3. Backward & Step
         loss.backward()
         optimizer.step()
         
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1:02d}/{epochs} - Contrastive Loss: {loss.item():.4f}")
+            print(f"Epoch {epoch+1:02d}/{epochs} - Contrastive Loss: {loss.item():.4f} - Exact Batch Match: {acc:.1f}%")
             
     # Swap back to eval for inference
     retriever.vit_model.eval()

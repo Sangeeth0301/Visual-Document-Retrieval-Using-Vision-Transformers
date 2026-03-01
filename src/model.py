@@ -23,14 +23,15 @@ class PositionalEncoding(nn.Module):
     def __init__(self, num_patches, embed_dim):
         super().__init__()
         # +1 for the CLS token
-        # Learnable 1D positional embeddings
-        self.pos_embed = nn.Parameter(torch.randn(1, num_patches + 1, embed_dim) * 0.02)
+        # Learnable 1D positional embeddings properly initialized with truncated normal distribution
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
         
     def forward(self, x):
         return x + self.pos_embed
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads):
+    def __init__(self, embed_dim, num_heads, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -38,8 +39,10 @@ class MultiHeadAttention(nn.Module):
         self.head_dim = embed_dim // num_heads
         
         # Compute Q, K, V simultaneously
-        self.qkv = nn.Linear(embed_dim, embed_dim * 3)
+        self.qkv = nn.Linear(embed_dim, embed_dim * 3, bias=True)
+        self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(embed_dim, embed_dim)
+        self.proj_drop = nn.Dropout(proj_drop)
         
     def forward(self, x):
         B, N, C = x.shape
@@ -53,26 +56,30 @@ class MultiHeadAttention(nn.Module):
         # Q @ K^T
         attn_scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
         attn_weights = attn_scores.softmax(dim=-1)
+        attn_weights = self.attn_drop(attn_weights)
         
         # Multiply by V
         x = (attn_weights @ v) # (B, num_heads, N, head_dim)
         x = x.transpose(1, 2).reshape(B, N, C) # Concat heads
         
         x = self.proj(x)
+        x = self.proj_drop(x)
         return x, attn_weights
 
 class TransformerBlock(nn.Module):
-    def __init__(self, embed_dim, num_heads, mlp_ratio=4.0):
+    def __init__(self, embed_dim, num_heads, mlp_ratio=4.0, drop=0.0, attn_drop=0.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(embed_dim)
-        self.attn = MultiHeadAttention(embed_dim, num_heads)
+        self.attn = MultiHeadAttention(embed_dim, num_heads, attn_drop=attn_drop, proj_drop=drop)
         self.norm2 = nn.LayerNorm(embed_dim)
         
         hidden_dim = int(embed_dim * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, embed_dim)
+            nn.Dropout(drop),
+            nn.Linear(hidden_dim, embed_dim),
+            nn.Dropout(drop)
         )
         
     def forward(self, x):
@@ -84,19 +91,21 @@ class TransformerBlock(nn.Module):
         return x, attn_weights
 
 class ViTEncoder(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768, depth=4, num_heads=8):
+    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768, depth=4, num_heads=8, drop_rate=0.0, attn_drop_rate=0.0):
         super().__init__()
         self.patch_embed = PatchEmbedding(img_size, patch_size, in_channels, embed_dim)
         
-        # [CLS] token as a learnable parameter
-        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        # [CLS] token as a learnable parameter initialized correctly
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
         
         # Positional encoding
         self.pos_embed = PositionalEncoding(self.patch_embed.num_patches, embed_dim)
+        self.pos_drop = nn.Dropout(p=drop_rate)
         
         # Transformer blocks
         self.blocks = nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads) for _ in range(depth)
+            TransformerBlock(embed_dim, num_heads, drop=drop_rate, attn_drop=attn_drop_rate) for _ in range(depth)
         ])
         
         self.norm = nn.LayerNorm(embed_dim)
@@ -110,8 +119,9 @@ class ViTEncoder(nn.Module):
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1) # (B, num_patches + 1, embed_dim)
         
-        # 3. Add Positional Encoding
+        # 3. Add Positional Encoding and Dropout
         x = self.pos_embed(x)
+        x = self.pos_drop(x)
         
         attn_weights = []
         # 4. Pass through Transformer Blocks

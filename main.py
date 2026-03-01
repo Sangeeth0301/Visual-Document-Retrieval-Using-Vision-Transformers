@@ -54,8 +54,8 @@ def main():
     print("    By training on our mini-task, we functionally link visual structures")
     print("    to their semantic representations via cosine projection.")
     
-    # Train for 20 epochs to overfit our small 3-document dataset
-    trained_retriever = train_retriever(retriever, corpus_images, training_queries, epochs=20, lr=5e-4)
+    # Train for 40 epochs to overfit our small 3-document dataset
+    trained_retriever = train_retriever(retriever, corpus_images, training_queries, epochs=40, lr=1e-3)
     
     # 4. Inference Phase
     print("\n[4] Execution: Visual Document Retrieval Simulation")

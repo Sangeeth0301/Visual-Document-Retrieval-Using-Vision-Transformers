@@ -1,0 +1,136 @@
+# Theory Guide: Transformers and Attention Mechanisms
+
+This guide explains the core theoretical foundations of the Vision Transformer (ViT) architecture used in our Visual Document Retrieval project. These concepts directly formulate the logic you will present in the "Theoretical Study" portion of your project.
+
+## 1. Self-Attention Mechanism
+
+The Self-Attention mechanism allows the model to look at other parts of an input sequence as it processes a certain part of the sequence. For visual documents, this is critical: it allows a patch containing the text "Figure 1" to securely attend to another patch far away that contains the actual chart image.
+
+### Derivation
+Given a sequence of input embeddings $X$ (which represent our image patches), we linearly project $X$ into three distinct representations using learned weight matrices $W_Q, W_K, W_V$:
+- **Q (Query)**: What the current patch is "looking for".
+- **K (Key)**: What the current patch "contains" or represents.
+- **V (Value)**: The actual informational content of the patch.
+
+$$ Q = X W_Q $$
+$$ K = X W_K $$
+$$ V = X W_V $$
+
+The self-attention score between all queries and keys evaluates how strongly each patch relates to every other patch:
+$$ \text{Attention}(Q, K, V) = \text{softmax}\left( \frac{QK^T}{\sqrt{d_k}} \right) V $$
+
+1.  **$QK^T$**: Computes the dot product (similarity) between every queried patch and all other keyed patches. High dot products imply strong relevance.
+2.  **$\text{softmax}$**: Normalizes the similarities so that for each query patch, the sum of attention directed towards all sequence patches equals $1$.
+3.  **Matrix Multiplication with $V$**: Computes a weighted average of the sequence's informational values based on the distribution calculated in the previous step.
+
+## 2. The Scaling Factor ($\sqrt{d_k}$)
+
+Notice the division by $\sqrt{d_k}$ in the formula above, where $d_k$ is the dimensionality of the key representations. Why is this necessary?
+
+If the dimensionality $d_k$ is large, the dot products of independently initialized or large random vectors can grow significantly in magnitude. When these large magnitudes are pushed through the $\text{softmax}(x) = \frac{e^{x_i}}{\sum e^{x_j}}$ function, the output distribution becomes extremely "sharp" (one value tends sharply toward 1, while the rest collapse to 0).
+
+As a result, the gradients of the softmax function drop to near zero for almost all components. This phenomenon, known as **vanishing gradients**, can completely freeze the learning process during backpropagation.
+
+Scaling by $1/\sqrt{d_k}$ counteracts this growth. It ensures that the variance of the dot products remains approximately $1$, leading to smoother, well-distributed initial attention scores and much healthier gradient flow.
+
+## 3. Multi-Head Attention
+
+Instead of performing a single attention function using the highly dimensional standard hidden size ($d_{model}$), Transformers map the queries, keys, and values $h$ times (the number of heads) utilizing varied, parallel linear projections.
+
+The standard attention function is performed *in parallel* on each of these projected subsets. Notice the benefit: this allows different logical portions of the model to jointly attend to entirely different representational patterns. For example, in our PDF processing mechanism, memory load is distributed such that **Head 1** might map correlations in text formatting (bolding vs unbolded), while **Head 2** strictly observes spatial image layout (where charts are situated relative to paragraphs).
+
+$$ \text{MultiHead}(Q, K, V) = \text{Concat}(\text{head}_1, \ldots, \text{head}_h)W^O $$
+where $\text{head}_i = \text{Attention}(QW_i^Q, KW_i^K, VW_i^V)$
+
+The separate heads are concatenated together and multiplied by a final comprehensive projection matrix $W^O$.
+
+## 4. Positional Encodings
+
+A severe structural difference between standard CNNs (Convolutional Neural Networks) and Transformers is how spatial context is evaluated. CNNs slide an ordered filter physically over an image; intrinsically maintaining locality. Conversely, Self-Attention examines every patch dynamically at the exact same time—an operation that is naturally permutation-invariant. In other words, out-of-the-box Transformers view an image as a chaotic "bag of scattered patches".
+
+To circumvent this and re-teach the Transformer the strict Euclidean 2D nature of a document, we append **Positional Encodings** to the input block embeddings *before* the first Attention mechanism is applied.
+
+The most famous variant uses fixed sinusoidal equations for 1D sequences:
+$$ PE_{(pos, 2i)} = \sin\left(\frac{pos}{10000^{2i/d_{model}}}\right) $$
+$$ PE_{(pos, 2i+1)} = \cos\left(\frac{pos}{10000^{2i/d_{model}}}\right) $$
+
+For a Vision application like ours, we typically use **Learnable 1D or 2D Embeddings**. These are parameter weights trained directly to represent positions (e.g., coordinates $(row, col)$). When these vectors are combined with our patch embeddings, dot products inside the Attention layer mathematically absorb spatial distances, granting the system an underlying sense of layout geometry without enforcing rigid localization constraints.
+
+## 5. System Architecture
+Here is the logical architecture of our Visual Document Retrieval framework:
+
+```mermaid
+flowchart TD
+    %% Styling
+    classDef pdf fill:#f9f,stroke:#333,stroke-width:2px;
+    classDef image fill:#ff9,stroke:#333,stroke-width:2px;
+    classDef model fill:#9cf,stroke:#333,stroke-width:2px;
+    classDef text fill:#dfd,stroke:#333,stroke-width:2px;
+    classDef compare fill:#fca,stroke:#333,stroke-width:2px;
+
+    %% Data Ingestion
+    PDFs["PDF Documents (3-5 small files)"]:::pdf --> Convert["Convert via PyMuPDF (150 DPI)"]:::pdf
+    Convert --> Images["PIL Images (Resize 224x224)"]:::image
+    
+    %% Target Query Ingestion
+    Query["User Text Query e.g 'Pongal festival map'"]:::text --> MiniLM["MiniLM Text Encoder"]:::model
+    MiniLM --> QueryEmb(("Text Embedding (384D)")):::text
+    
+    %% Vision Transformer Pipeline
+    Images --> Patch["Patch Embedding (16x16 -> 768D)"]:::model
+    Patch --> CLS["Prepend [CLS] Token"]:::model
+    CLS --> PosEn["Add Positional Encodings (1D Array)"]:::model
+    
+    PosEn --> Block1["Transformer Block (MSA + MLP)"]:::model
+    Block1 --> Block2["Transformer Block (MSA + MLP)"]:::model
+    
+    Block2 --> Output["Extract [CLS] Token"]:::model
+    Output --> Proj["Linear Alignment Projection (768D -> 384D)"]:::model
+    Proj --> ImageEmb(("Image Embedding (384D)")):::image
+    
+    %% Resolution
+    QueryEmb --> Cosine["Calculate Cosine Similarity"]:::compare
+    ImageEmb --> Cosine
+    
+    Cosine --> Ranked["Ranked Output (Top-K PDFs)"]:::compare
+    Block2 -.-> ExtractAttn["Extract Last Layer Attention Weights"]:::compare
+    ExtractAttn -.-> Ranked
+    Ranked --> Heatmap(("Attention Heatmap Visualization")):::image
+```
+
+## 6. Vision Transformer Detail Block
+Specifically, here is a detailed dive into what takes place inside the `Transformer Block (MSA + MLP)` representation from above.
+
+```mermaid
+flowchart TD
+    classDef input fill:#ddd,stroke:#333,stroke-width:2px;
+    classDef norm fill:#d1e7dd,stroke:#333,stroke-width:2px;
+    classDef attention fill:#cff4fc,stroke:#333,stroke-width:2px;
+    classDef mlp fill:#f8d7da,stroke:#333,stroke-width:2px;
+    classDef output fill:#ddd,stroke:#333,stroke-width:2px;
+    
+    Input["Input Tokens (B, N, D)"]:::input --> Norm1["Layer Normalization"]:::norm
+    Norm1 --> MHA["Multi-Head Self-Attention"]:::attention
+    
+    %% MHA Breakdown
+    MHA -->|Generate| Q["Queries (Q)"]:::attention
+    MHA -->|Generate| K["Keys (K)"]:::attention
+    MHA -->|Generate| V["Values (V)"]:::attention
+    Q & K -->|Q * K^T / sqrt(d_k)| Scores["Attention Scores"]:::attention
+    Scores --> Softmax["Softmax"]:::attention
+    Softmax & V -->|Multiply| WeightedV["Weighted Values"]:::attention
+    WeightedV --> ConcatHeads["Concatenate Parallel Heads -> Linear Projection"]:::attention
+    ConcatHeads --> AttentionOut
+    
+    %% Residuals
+    Input -->|Residual Connection (+)| AttentionOut["Add Attention to Input"]:::attention
+    
+    %% MLP Block
+    AttentionOut --> Norm2["Layer Normalization"]:::norm
+    Norm2 --> FeedForward1["Linear Layer (Scale D -> 4D) + GELU"]:::mlp
+    FeedForward1 --> FeedForward2["Linear Layer (Scale 4D -> D)"]:::mlp
+    
+    %% Residuals
+    AttentionOut -->|Residual Connection (+)| OutputTokens["Add MLP output to Residual"]:::output
+    FeedForward2 --> OutputTokens
+```

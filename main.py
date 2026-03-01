@@ -5,99 +5,109 @@ import warnings
 # Suppress HuggingFace and local warnings to clean up output
 warnings.filterwarnings("ignore") 
 
-from src.dataset import load_documents
+from src.dataset_loader import get_dataloader
 from src.model import ViTEncoder
 from src.retrieval import DocumentRetriever
-from src.train import train_retriever
-from src.visualize import plot_attention_map
+from src.train import train_retriever, set_seed
+from src.evaluate import compute_retrieval_metrics, save_metrics
+from src.visualize import plot_attention_map, save_retrieval_example
 
 def main():
-    print("\n" + "="*50)
-    print(" EDUCATIONAL VISUAL DOCUMENT RETRIEVAL BASELINE")
-    print("="*50)
+    print("\n" + "="*60)
+    print(" VISUAL DOCUMENT RETRIEVAL - EVALUATION FRAMEWORK")
+    print("="*60)
     
+    # 0. Set Reproducibility
+    set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Hardware backend: {device.upper()}")
     
-    # 1. Load Data
-    data_dir = "data/pdfs"
-    print(f"\n[1] Attempting to load PDFs from {data_dir}...")
-    corpus_images, metadata = load_documents(data_dir)
+    # 1. Ensure Data Exists
+    train_dir = "data/train"
+    train_json = "data/train_mapping.json"
+    test_dir = "data/test"
+    test_json = "data/test_mapping.json"
     
-    if not corpus_images:
-        print(f"--> No PDFs found. Please generate them first by running: python create_dummy_pdfs.py")
-        return
+    if not os.path.exists(train_dir) or not os.path.exists(test_json):
+        print("--> Generating deterministic Document Dataset splits...")
+        import create_dataset
+        create_dataset.generate_samples()
         
-    print(f"--> Successfully loaded {len(corpus_images)} document pages.")
+    print(f"\n[1] Initializing PyTorch DataLoaders...")
+    train_loader = get_dataloader(train_dir, train_json, batch_size=2, shuffle=True)
+    test_loader = get_dataloader(test_dir, test_json, batch_size=2, shuffle=False)
     
-    # Define our "Mini-Task" Training target queries
-    # Since we are training a ViT directly over a small synthetic corpus, 
-    # we pair each page with a descriptive matching query.
-    training_queries = [
-        "A travel guide detailing Marina Beach, Kapaleeshwarar Temple, and Chennai tourism highlights.",
-        "Tamil Nadu festival dates, specifically information regarding the Pongal harvest celebration.",
-        "Dravidian temple architecture, gopurams, and Thanjavur carvings."
-    ]
-    
-    if len(training_queries) != len(corpus_images):
-        print("--> Warning: Training queries do not have a 1:1 match with pages. Some documents may not be learned.")
-        
     # 2. Instantiate Model
-    print("\n[2] Instantiating the scratch-built Vision Transformer...")
-    # A tiny ViT tailored for this baseline 
-    vit = ViTEncoder(img_size=224, patch_size=16, embed_dim=768, depth=2, num_heads=4)
+    print("\n[2] Instantiating Vision Transformer (ViT)...")
+    vit = ViTEncoder(img_size=224, patch_size=16, embed_dim=768, depth=2, num_heads=4, drop_rate=0.1, attn_drop_rate=0.1)
     retriever = DocumentRetriever(vit, device=device)
     
-    # 3. Train the System (Contrastive Image-Text Alignment)
-    print("\n[3] Initiating Contrastive Alignment Training...")
-    print("    NOTE: An untrained ViT outputs random structural noise.")
-    print("    By training on our mini-task, we functionally link visual structures")
-    print("    to their semantic representations via cosine projection.")
+    # 3. Train
+    print("\n[3] Executing InfoNCE Contrastive Training across Dataloader...")
+    trained_retriever = train_retriever(retriever, train_loader, epochs=40, lr=1e-3, output_dir="results")
     
-    # Train for 40 epochs to overfit our small 3-document dataset
-    trained_retriever = train_retriever(retriever, corpus_images, training_queries, epochs=40, lr=1e-3)
+    # 4. Evaluation Vectorization
+    print("\n[4] Computing Inference and Metrics on Test Set...")
+    all_doc_embs = []
+    all_query_embs = []
+    all_doc_paths = []
     
-    # 4. Inference Phase
-    print("\n[4] Execution: Visual Document Retrieval Simulation")
-    
-    # Try a query conceptually similar to document 1 (Chennai beach)
-    user_query = "Where can I find information about the longest natural urban beach in Chennai?"
-    print(f"--> User Query: '{user_query}'")
-    
-    # Embed the corpus images with our freshly trained ViT
-    doc_embs = trained_retriever.embed_images(corpus_images)
-    
-    # Embed the text query using MiniLM
-    query_emb = trained_retriever.embed_queries([user_query])
-    
-    # Search for matching layouts using Cosine Similarity
-    scores, indices = trained_retriever.search(query_emb, doc_embs, top_k=2)
-    
-    print("\n--- Retrieval Results ---")
-    best_match_idx = indices[0][0].item()
-    for i in range(len(indices[0])):
-        idx = indices[0][i].item()
-        score = scores[0][i].item()
-        doc_meta = metadata[idx]
-        print(f"Rank {i+1}: {doc_meta['file']} (Page {doc_meta['page']}) -> Sim Score: {score:.4f}")
+    for batch in test_loader:
+        images = batch["image"].to(device)
+        queries = batch["query"]
+        paths = batch["image_path"]
         
-    # 5. Extract and Plot the Attention Map
-    print(f"\n[5] Extracting Multi-Head Attention Layout from the Top Result...")
-    best_image = corpus_images[best_match_idx]
+        # Images
+        with torch.no_grad():
+            vit_embeddings = trained_retriever.vit_model(images)
+            aligned_embeddings = trained_retriever.proj(vit_embeddings)
+            img_embs = torch.nn.functional.normalize(aligned_embeddings, p=2, dim=-1)
+            
+            # Text Tracking
+            text_raw = trained_retriever.text_encoder.encode(queries, convert_to_tensor=True, device=device)
+            text_embs = torch.nn.functional.normalize(text_raw, p=2, dim=-1)
+            
+            all_doc_embs.append(img_embs)
+            all_query_embs.append(text_embs)
+            all_doc_paths.extend(paths)
+            
+    doc_embs_mat = torch.cat(all_doc_embs)
+    query_embs_mat = torch.cat(all_query_embs)
     
-    # Convert image back to a tensor to pass through the ViT one last time and grab the weights
-    img_tensor = trained_retriever.image_transform(best_image).unsqueeze(0).to(device)
+    # 5. Compute Quantitative Metrics
+    metrics = compute_retrieval_metrics(query_embs_mat, doc_embs_mat, top_k_list=[1, 5])
+    save_metrics(metrics, output_file="results/metrics.csv")
     
-    # We must explicitly request the attentions from the forward loop
-    with torch.no_grad():
-        _, attn_weights = trained_retriever.vit_model(img_tensor, return_attn=True)
+    # 6. Qualitative Results (Top-1 Visualizations)
+    print("\n[6] Rendering Visual Examples to `/results/`...")
+    top_k = min(2, len(all_doc_paths))
+    sims = torch.matmul(query_embs_mat, doc_embs_mat.T)
+    top_scores, top_indices = torch.topk(sims, top_k, dim=1)
+    
+    for i in range(len(all_doc_paths)):
+        retrieved_paths = [all_doc_paths[idx.item()] for idx in top_indices[i]]
+        save_retrieval_example(
+            query_text=test_loader.dataset.queries[i],
+            retrieved_images=retrieved_paths,
+            scores=top_scores[i].tolist(),
+            ranks=list(range(1, top_k + 1)),
+            query_idx=i,
+            save_dir="results/retrieval_examples"
+        )
         
-    # Isolate the final Transformer block's attention matrix
-    last_layer_attn = attn_weights[-1] 
-    
-    print("    Opening Heatmap visualization window. Close the window to exit the program.")
-    plot_attention_map(best_image, last_layer_attn)
-    print("\nExecution complete.")
+        # Heatmap generation for Top 1 retrieved doc
+        best_doc_idx = top_indices[i][0]
+        best_image = test_loader.dataset[best_doc_idx.item()]["image"].unsqueeze(0).to(device)
+        with torch.no_grad():
+             _, attn_weights = trained_retriever.vit_model(best_image, return_attn=True)
+             
+        plot_attention_map(
+            image_path=retrieved_paths[0], 
+            attention_weights=attn_weights[-1], 
+            save_dir="results/attention_maps"
+        )
+        
+    print("\nExperiment Run Complete! Check the /results/ folder for outputs.")
 
 if __name__ == "__main__":
     main()

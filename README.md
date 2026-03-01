@@ -2,7 +2,7 @@
 
 A Deep Learning educational baseline project that implements a Vision Transformer (ViT) from scratch to perform visual document retrieval. Inspired by modern vision-language models like ColPali, this project treats PDF documents holistically as images to preserve document layout, charts, and spatial features, matching them against text queries using a custom, lightweight ViT.
 
-## Problem Statement
+## 1. Problem Statement
 
 Traditional document search heavily relies on OCR (Optical Character Recognition) to extract text, convert it to embeddings, and perform semantic search. However, this approach completely loses crucial visual and layout information. For example:
 - The spatial relationship between a chart and its caption.
@@ -12,7 +12,7 @@ Traditional document search heavily relies on OCR (Optical Character Recognition
 
 **The Core Challenge:** How can Transformers process PDF documents holistically using global self-attention while preserving their 2D spatial relationships?
 
-## Optimal Methodology and Approach
+## 2. Methodology Overview
 
 This project bypasses OCR entirely. We adopt an image-centric approach:
 1. **Visual Ingestion**: PDF pages are directly converted into high-resolution images.
@@ -22,121 +22,72 @@ This project bypasses OCR entirely. We adopt an image-centric approach:
 5. **Cross-Modal Retrieval**: We project the final `[CLS]` token embedding of the ViT into the same vector space as a frozen lightweight text encoder (`MiniLM`). Documents are ranked against a user query using pure Cosine Similarity.
 6. **Interpretability**: By extracting the Multi-Head Attention weights from the final Transformer layer, we overlay a heatmap on the original document to visually interpret exactly *where* the model was looking to satisfy a given query.
 
-## Framework and Architecture Diagrams
+## 3. Dataset Description
 
-### System Architecture
+The system processes a deterministic, synthetic visual document dataset generated on the fly.
+* **Train / Test Split:** Evaluated documents are split into isolated `/data/train` and `/data/test` subsets.
+* **Mappings:** Query-to-Image relations are explicitly mapped in deterministic JSON files (`train_mapping.json`, `test_mapping.json`). 
+* **Preprocessing:** Images are deterministically resized to `224x224`, converted to tensors, and Z-score normalized against ImageNet specifications using PyTorch primitives.
 
-The following diagram tracks the macro-level data flow, from raw PDF ingestion to Query matching and Heatmap Visualization.
+## 4. Experimental Setup
 
-```mermaid
-flowchart TD
-    %% Styling
-    classDef pdf fill:#f9f,stroke:#333,stroke-width:2px;
-    classDef image fill:#ff9,stroke:#333,stroke-width:2px;
-    classDef model fill:#9cf,stroke:#333,stroke-width:2px;
-    classDef text fill:#dfd,stroke:#333,stroke-width:2px;
-    classDef compare fill:#fca,stroke:#333,stroke-width:2px;
+*   **ViT Architecture**: 
+    *   **Patch Size:** 16x16
+    *   **Embedding Dimension:** 768D (projected down to 384D for Text alignment)
+    *   **Layers:** 2 Transformer Layers
+    *   **Attention Heads:** 4 parallel heads
+    *   **Regularization:** Dropout at $p=0.1$ across MLP and Attention projections. Learnable parameters initialized using Truncated Normal distribution.
+*   **Optimization**:
+    *   **Optimizer:** `AdamW`
+    *   **Learning Rate:** $1e-3$ for Projection arrays, $1e-4$ for ViT parameters.
+    *   **Loss Function:** Symmetric InfoNCE Contrastive Loss (Temperature = $0.07$).
+    *   **Compute Target:** Operates efficiently on standard CPU or Google Colab environments.
 
-    %% Data Ingestion
-    PDFs["PDF Documents (3-5 small files)"]:::pdf --> Convert["Convert via PyMuPDF (150 DPI)"]:::pdf
-    Convert --> Images["PIL Images (Resize 224x224)"]:::image
-    
-    %% Target Query Ingestion
-    Query["User Text Query e.g 'Pongal festival map'"]:::text --> MiniLM["MiniLM Text Encoder"]:::model
-    MiniLM --> QueryEmb(("Text Embedding (384D)")):::text
-    
-    %% Vision Transformer Pipeline
-    Images --> Patch["Patch Embedding (16x16 -> 768D)"]:::model
-    Patch --> CLS["Prepend [CLS] Token"]:::model
-    CLS --> PosEn["Add Positional Encodings (1D Array)"]:::model
-    
-    PosEn --> Block1["Transformer Block (MSA + MLP)"]:::model
-    Block1 --> Block2["Transformer Block (MSA + MLP)"]:::model
-    
-    Block2 --> Output["Extract [CLS] Token"]:::model
-    Output --> Proj["Linear Alignment Projection (768D -> 384D)"]:::model
-    Proj --> ImageEmb(("Image Embedding (384D)")):::image
-    
-    %% Resolution
-    QueryEmb --> Cosine["Calculate Cosine Similarity"]:::compare
-    ImageEmb --> Cosine
-    
-    Cosine --> Ranked["Ranked Output (Top-K PDFs)"]:::compare
-    Block2 -.-> ExtractAttn["Extract Last Layer Attention Weights"]:::compare
-    ExtractAttn -.-> Ranked
-    Ranked --> Heatmap(("Attention Heatmap Visualization")):::image
-```
+## 5. Evaluation Metrics
 
-### Vision Transformer Detailed Block
+Because our system natively matches queries to documents, we utilize standard retrieval evaluation statistics computed over cosine similarity score spaces.
+*   **Recall@1**: The percentage of test queries for which the exact matching document is ranked absolutely first.
+*   **Recall@5**: The percentage of test queries for which the exact matching document appears anywhere within the top 5 ranked documents. Highly useful in general search engines.
 
-A localized view of how input token representations are dynamically routed through Self-Attention and Multi-Layer Perceptrons.
+## 6. Quantitative Results
 
-```mermaid
-flowchart TD
-    classDef input fill:#ddd,stroke:#333,stroke-width:2px;
-    classDef norm fill:#d1e7dd,stroke:#333,stroke-width:2px;
-    classDef attention fill:#cff4fc,stroke:#333,stroke-width:2px;
-    classDef mlp fill:#f8d7da,stroke:#333,stroke-width:2px;
-    classDef output fill:#ddd,stroke:#333,stroke-width:2px;
-    
-    Input["Input Tokens (B, N, D)"]:::input --> Norm1["Layer Normalization"]:::norm
-    Norm1 --> MHA["Multi-Head Self-Attention"]:::attention
-    
-    %% MHA Breakdown
-    MHA -->|Generate| Q["Queries (Q)"]:::attention
-    MHA -->|Generate| K["Keys (K)"]:::attention
-    MHA -->|Generate| V["Values (V)"]:::attention
-    Q & K -->|Q * K^T / sqrt(d_k)| Scores["Attention Scores"]:::attention
-    Scores --> Softmax["Softmax"]:::attention
-    Softmax & V -->|Multiply| WeightedV["Weighted Values"]:::attention
-    WeightedV --> ConcatHeads["Concatenate Parallel Heads -> Linear Projection"]:::attention
-    ConcatHeads --> AttentionOut
-    
-    %% Residuals
-    Input -->|Residual Connection (+)| AttentionOut["Add Attention to Input"]:::attention
-    
-    %% MLP Block
-    AttentionOut --> Norm2["Layer Normalization"]:::norm
-    Norm2 --> FeedForward1["Linear Layer (Scale D -> 4D) + GELU"]:::mlp
-    FeedForward1 --> FeedForward2["Linear Layer (Scale 4D -> D)"]:::mlp
-    
-    %% Residuals
-    AttentionOut -->|Residual Connection (+)| OutputTokens["Add MLP output to Residual"]:::output
-    FeedForward2 --> OutputTokens
-```
+Evaluation is fully automated post-training. The resulting accuracy arrays are written to the `/results/metrics.csv` evaluation artifact.
 
-## Setup and Execution
+| Model | Evaluation Split | Recall@1 | Recall@5 |
+|-------|------------------|----------|----------|
+| Custom Baseline ViT | Test | Computed at Runtime | Computed at Runtime |
 
-### 1. Requirements
+> *Note: Due to the micro-batch size utilized for educational baselining purposes, metrics rapidly approach 100% post-convergence. A training loss plot is generated dynamically at `/results/training_curves.png`.*
 
-Ensure you have Python 3.8+ installed. Install the dependencies via:
+## 7. Attention Visualization
 
+Inside the `/results/attention_maps/` directory, the framework isolates the structural probability layout emitted by the final multi-head block via the `[CLS]` token. 
+Dark red hotspots highlight the precise patches the Transformer focused on structurally to answer the given text query without OCR. Examples of query-to-document mappings can be found in `/results/retrieval_examples/`.
+
+## 8. Limitations
+
+*   **Small Dataset Scale**: Due to CPU overhead, the dataset scale is artificially compressed. Massive datasets would necessitate `DistributedDataParallel` implementation and memory optimizations.
+*   **1D Positional Encodings**: The 1D sequence mapping does not distinctly capture absolute Cartesian distances in horizontal vs vertical document layouts inherently.
+*   **Frozen Language Embeddings**: The text representation manifold remains static due to freezing `MiniLM`, limiting bi-modal alignment ceiling capabilities.
+
+## 9. Future Work
+
+While 1D positional encoding preserves patch ordering, future work may explore 2D relative positional embeddings for improved spatial modeling.
+
+## 10. Reproducibility
+
+This baseline is fully operational within local Anaconda/Virtual Environments and completely compatible with **Google Colab**.
+
+### Installation
 ```bash
+git clone https://github.com/Sangeeth0301/Visual-Document-Retrieval-Using-Vision-Transformers.git
+cd Visual-Document-Retrieval-Using-Vision-Transformers
 pip install -r requirements.txt
 ```
 
-### 2. Prepare Sample Dataset
-
-For this educational baseline, we have included a script to synthetically generate a small dataset of dummy PDF documents containing test layouts about Chennai / Tamil Nadu.
-
-```bash
-python create_dummy_pdfs.py
-```
-
-### 3. Run the Framework
-
-Execute the main orchestrator script. This script will instantiate the PyTorch modules, run an InfoNCE contrastive training loop over the generated PDFs to rapidly align the Image embeddings with Text queries, perform a sample query execution, and display the Matplotlib visual heatmaps.
+### Execution
+The framework initializes deterministic random seeds internally. Running the primary orchestrator automatically builds the datasets via the `create_dataset.py` pipeline, triggers Contrastive Training, processes Metric Evaluation, and writes all plotting visualizations to the `/results` directory.
 
 ```bash
 python main.py
 ```
-
-## Repository Structure
-
-- `src/model.py`: Scratch-built core Vision Transformer blocks (PatchEmbedding, PositionalEncoding, MultiHeadAttention, ViTEncoder).
-- `src/dataset.py`: PDF handling and PIL conversion utilizing PyMuPDF.
-- `src/retrieval.py`: Setup for MiniLM text embedding and cosine similarity ranking.
-- `src/train.py`: InfoNCE logic for contrastively aligning visual and textual representations.
-- `src/visualize.py`: Heatmap interpolation and formatting functions.
-- `main.py`: Entry point for simulation block.
-- `create_dummy_pdfs.py`: Script to generate quick synthetic datasets.

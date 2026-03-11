@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import math
+from torchvision.models import vit_b_16, ViT_B_16_Weights
 
 class PatchEmbedding(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768):
@@ -31,10 +32,11 @@ class PositionalEncoding(nn.Module):
         return x + self.pos_embed
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, embed_dim, num_heads, attn_drop=0.0, proj_drop=0.0):
+    def __init__(self, embed_dim, num_heads, attn_drop=0.0, proj_drop=0.0, use_scaling=True):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
+        self.use_scaling = use_scaling
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         self.head_dim = embed_dim // num_heads
         
@@ -54,7 +56,8 @@ class MultiHeadAttention(nn.Module):
         
         # Attention(Q, K, V) = softmax(QK^T / sqrt(d_k)) V
         # Q @ K^T
-        attn_scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+        scaling = (1.0 / math.sqrt(self.head_dim)) if self.use_scaling else 1.0
+        attn_scores = (q @ k.transpose(-2, -1)) * scaling
         attn_weights = attn_scores.softmax(dim=-1)
         attn_weights = self.attn_drop(attn_weights)
         
@@ -67,10 +70,10 @@ class MultiHeadAttention(nn.Module):
         return x, attn_weights
 
 class TransformerBlock(nn.Module):
-    def __init__(self, embed_dim, num_heads, mlp_ratio=4.0, drop=0.0, attn_drop=0.0):
+    def __init__(self, embed_dim, num_heads, mlp_ratio=4.0, drop=0.0, attn_drop=0.0, use_scaling=True):
         super().__init__()
         self.norm1 = nn.LayerNorm(embed_dim)
-        self.attn = MultiHeadAttention(embed_dim, num_heads, attn_drop=attn_drop, proj_drop=drop)
+        self.attn = MultiHeadAttention(embed_dim, num_heads, attn_drop=attn_drop, proj_drop=drop, use_scaling=use_scaling)
         self.norm2 = nn.LayerNorm(embed_dim)
         
         hidden_dim = int(embed_dim * mlp_ratio)
@@ -91,9 +94,10 @@ class TransformerBlock(nn.Module):
         return x, attn_weights
 
 class ViTEncoder(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768, depth=4, num_heads=8, drop_rate=0.0, attn_drop_rate=0.0):
+    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768, depth=4, num_heads=8, drop_rate=0.0, attn_drop_rate=0.0, use_pos_embed=True, use_scaling=True):
         super().__init__()
         self.patch_embed = PatchEmbedding(img_size, patch_size, in_channels, embed_dim)
+        self.use_pos_embed = use_pos_embed
         
         # [CLS] token as a learnable parameter initialized correctly
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
@@ -105,7 +109,7 @@ class ViTEncoder(nn.Module):
         
         # Transformer blocks
         self.blocks = nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads, drop=drop_rate, attn_drop=attn_drop_rate) for _ in range(depth)
+            TransformerBlock(embed_dim, num_heads, drop=drop_rate, attn_drop=attn_drop_rate, use_scaling=use_scaling) for _ in range(depth)
         ])
         
         self.norm = nn.LayerNorm(embed_dim)
@@ -120,7 +124,8 @@ class ViTEncoder(nn.Module):
         x = torch.cat((cls_tokens, x), dim=1) # (B, num_patches + 1, embed_dim)
         
         # 3. Add Positional Encoding and Dropout
-        x = self.pos_embed(x)
+        if self.use_pos_embed:
+            x = self.pos_embed(x)
         x = self.pos_drop(x)
         
         attn_weights = []
@@ -138,3 +143,23 @@ class ViTEncoder(nn.Module):
         if return_attn:
             return cls_embedding, attn_weights
         return cls_embedding
+
+class BetterViTEncoder(nn.Module):
+    def __init__(self, embed_dim=768, pretrained=True):
+        super().__init__()
+        if pretrained:
+            weights = ViT_B_16_Weights.IMAGENET1K_V1
+            self.model = vit_b_16(weights=weights)
+        else:
+            self.model = vit_b_16(weights=None)
+            
+        # We only need the backbone, not the final classification head
+        self.model.heads = nn.Identity()
+        
+    def forward(self, x, return_attn=False):
+        # x: (B, 3, 224, 224)
+        if return_attn:
+            # Note: torchvision's ViT doesn't easily return attention maps without hooks
+            # We'll skip attn for the 'Better' model for simplicity or use a hook later
+            return self.model(x), None
+        return self.model(x)

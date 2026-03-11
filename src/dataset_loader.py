@@ -6,7 +6,7 @@ from PIL import Image
 import torchvision.transforms as transforms
 
 class DocumentDataset(Dataset):
-    def __init__(self, data_dir, mapping_file, transform=None):
+    def __init__(self, data_dir, mapping_file, transform=None, augment=False):
         """
         Args:
             data_dir (str): Directory containing the images.
@@ -23,12 +23,22 @@ class DocumentDataset(Dataset):
         if transform:
             self.transform = transform
         else:
-            self.transform = transforms.Compose([
+            base_transforms = [
                 transforms.Resize((224, 224)),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], 
                                      std=[0.229, 0.224, 0.225])
-            ])
+            ]
+            
+            if augment:
+                # Add mild augmentations for document robustness
+                aug_transforms = [
+                    transforms.RandomRotation(2),
+                    transforms.ColorJitter(brightness=0.1, contrast=0.1),
+                ] + base_transforms
+                self.transform = transforms.Compose(aug_transforms)
+            else:
+                self.transform = transforms.Compose(base_transforms)
 
     def __len__(self):
         return len(self.image_files)
@@ -47,6 +57,6 @@ class DocumentDataset(Dataset):
         
         return {"image": image, "query": query, "image_path": img_path}
 
-def get_dataloader(data_dir, mapping_file, batch_size=4, shuffle=True, num_workers=0):
-    dataset = DocumentDataset(data_dir, mapping_file)
+def get_dataloader(data_dir, mapping_file, batch_size=4, shuffle=True, num_workers=0, augment=False):
+    dataset = DocumentDataset(data_dir, mapping_file, augment=augment)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
